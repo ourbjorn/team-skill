@@ -1,0 +1,4 @@
+.DS_Store
+# created when you run teams inside this repo
+.team/
+.worktrees/

@@ -1,0 +1,9 @@
+{
+  "name": "rex-x",
+  "version": "0.1.0",
+  "description": "Extensions for running Claude Code in Rex. Includes the team skill: a lead Claude orchestrates parallel worker Claudes, each in its own Rex tab, git worktree and branch.",
+  "author": { "name": "ourbjorn" },
+  "repository": "https://github.com/ourbjorn/team-skill",
+  "license": "MIT",
+  "keywords": ["rex", "agents", "orchestration", "worktrees", "teams"]
+}

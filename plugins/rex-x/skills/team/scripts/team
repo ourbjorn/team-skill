@@ -1,0 +1,954 @@
+#!/usr/bin/env bash
+# team: run Claude Code agent teams in Rex.
+# One Rex session per team, one tab + one git worktree (own branch) per worker.
+# State lives in <repo>/.team/<team>/. Worker status comes from Rex's
+# Program Status Protocol, which Claude Code reports natively.
+set -euo pipefail
+
+SKILL_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+POLL=${TEAM_POLL:-3}
+# Role layers, first match wins: repo (.team/roles), user (personal), built-in.
+USER_ROLES=${TEAM_USER_ROLES:-$HOME/.claude/team/roles}
+BUILTIN_ROLES=$SKILL_DIR/roles
+
+die() { echo "team: $*" >&2; exit 1; }
+
+# ---------- requirements ----------
+
+install_hint() { # TOOL
+  case $1 in
+    rex)    echo "install Rex: https://www.superlogical.com/rex/docs" ;;
+    jq)     echo "brew install jq" ;;
+    git)    echo "xcode-select --install   (or: brew install git)" ;;
+    claude) echo "install Claude Code: https://code.claude.com/docs" ;;
+  esac
+}
+
+git_ok() { # git 2.31+ is needed for rev-parse --path-format
+  local v; v=$(git --version 2>/dev/null | awk '{print $3}')
+  [ "${v%%.*}" -gt 2 ] 2>/dev/null && return 0
+  [ "${v%%.*}" = 2 ] && v=${v#*.} && [ "${v%%.*}" -ge 31 ] 2>/dev/null
+}
+
+rex_up() { rex --timeout 3s whoami --json >/dev/null 2>&1; }
+
+# Fail once, naming everything that's missing for this command.
+require() { # TOOL... [server]
+  local t problems=()
+  for t in "$@"; do
+    case $t in
+      server) command -v rex >/dev/null && ! rex_up &&
+                problems+=("Rex server not reachable: open the Rex app (check with: rex whoami)") ;;
+      *) if ! command -v "$t" >/dev/null; then problems+=("$t not found: $(install_hint "$t")")
+         elif [ "$t" = git ] && ! git_ok; then problems+=("git $(git --version | awk '{print $3}') is too old, 2.31+ needed: $(install_hint git)")
+         fi ;;
+    esac
+  done
+  [ ${#problems[@]} -eq 0 ] && return 0
+  { echo "team: missing requirements:"; printf '  - %s\n' "${problems[@]}"; echo "  (run 'team doctor' for a full check)"; } >&2
+  exit 1
+}
+
+cmd_doctor() {
+  local bad=0 t v
+  local g="" r="" y="" n=""
+  [ -t 1 ] && g=$'\033[32m' r=$'\033[31m' y=$'\033[33m' n=$'\033[0m'
+  ok()   { printf '  %s✓%s %s\n' "$g" "$n" "$*"; }
+  fail() { printf '  %s✗%s %s\n' "$r" "$n" "$*"; bad=1; }
+  info() { printf '  %s·%s %s\n' "$y" "$n" "$*"; }
+  echo "Required"
+  for t in rex jq git claude; do
+    if ! command -v "$t" >/dev/null; then fail "$t: not found. $(install_hint "$t")"; continue; fi
+    case $t in
+      rex)    v=$(rex version 2>/dev/null | head -1) ;;
+      jq)     v=$(jq --version 2>/dev/null) ;;
+      git)    v=$(git --version 2>/dev/null | awk '{print $3}') ;;
+      claude) v=$(claude --version 2>/dev/null | head -1) ;;
+    esac
+    if [ "$t" = git ] && ! git_ok; then fail "git $v: 2.31+ needed. $(install_hint git)"; else ok "$t ($v)"; fi
+  done
+  if command -v rex >/dev/null; then
+    if rex_up; then ok "Rex server reachable"; else fail "Rex server not reachable: open the Rex app (check with: rex whoami)"; fi
+  fi
+  echo "Recommended"
+  if [ -n "${REX_SESSION:-}" ]; then ok "running inside Rex"; else info "not running inside Rex: start Claude in a Rex terminal so you can watch the team"; fi
+  if [ -f "$HOME/.claude/skills/rex/SKILL.md" ]; then ok "Rex agent skill installed"
+  else info "Rex agent skill not installed: run 'rex skill setup' (lets the lead use Rex beyond teams)"; fi
+  info "Remote Control in Rex settings lets 'team focus' switch your screen (can't be checked from here)"
+  if git rev-parse --git-dir >/dev/null 2>&1; then ok "inside a git repository"; else info "not inside a git repository: run team commands from your repo"; fi
+  [ $bad -eq 0 ] && echo "All required checks passed." || echo "Fix the ✗ items above."
+  return $bad
+}
+
+usage() {
+  cat <<'EOF'
+usage: team <command> [args]
+
+  up     TEAM [--base REF] [--plan FILE|-] [SPEC...]
+                                   new Rex session, one worktree + Claude worker per SPEC
+                                   SPEC = ROLE (worker named ROLE) or ROLE@LABEL (worker
+                                   ROLE-LABEL), e.g. be@orders be@billing fe test
+                                   --base: start from REF instead of HEAD
+                                   --plan: one worker per line: SPEC [--base REF] [PATH...]
+  add    TEAM SPEC [--base REF] [PATH...]  add a worker to a running team
+  task   TEAM WORKER [FILE]        set the worker's task (from FILE or stdin)
+  own    TEAM [WORKER PATH...]     set the paths a worker may change; no args: list all
+  assign TEAM WORKER... [--force]  tell workers to start (refuses on overlapping ownership)
+  send   TEAM WORKER MESSAGE       type one line into a worker and press enter
+  wait   TEAM [WORKER...] [--for S]  block until workers are done / blocked / failed
+  status TEAM                      state of every worker
+  check  TEAM                      changes outside owned paths, files changed by 2+ workers
+  read   TEAM WORKER [--screen [N]]  worker's report, or the last N screen lines
+  stop   TEAM WORKER               interrupt the worker (Esc)
+  focus  TEAM WORKER               show the worker's tab in the Rex app
+  inbox                            every Claude pane in Rex that needs you
+  ls                               teams in this repo
+  rules                            the workers' shared allow/deny list
+  doctor                           check requirements (rex, jq, git 2.31+, claude, Rex server)
+  down   TEAM [--force]            close the session, keep approved rules, remove
+                                   worktrees (branches kept)
+
+  role ls                          roles available here, with scope and model
+  role new ROLE [--model M] [--user] [--from ROLE] [--force] [FILE|-]
+                                   create a role file; body from FILE or stdin (-),
+                                   copied from another role, or a template
+  role show|edit ROLE              print / open in $EDITOR (a built-in is copied to
+                                   your user roles first)
+  role rm ROLE [--user]            delete a repo (or user) role file
+                                   (repo roles: <repo>/.team/roles/, committable;
+                                    --user: ~/.claude/team/roles/, all your repos)
+
+wait exit codes: 0 all done, 2 some blocked, 3 some failed/gone, 124 timed out
+env: TEAM_CLAUDE_ARGS  extra claude args (default: --permission-mode auto)
+     TEAM_SETTINGS     workers' settings file (default: <repo>/.team/settings.json,
+                       seeded from the skill's settings.json; "none" disables)
+     TEAM_WORKTREES    worktree parent dir (default: <repo>/.worktrees)
+EOF
+}
+
+# ---------- repo + state helpers ----------
+
+repo_root() {
+  local common
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || die "not inside a git repository"
+  dirname "$common"
+}
+
+init_repo() {
+  ROOT=$(repo_root)
+  WT_PARENT=${TEAM_WORKTREES:-$ROOT/.worktrees}
+  local exclude
+  exclude="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)/info/exclude"
+  mkdir -p "$(dirname "$exclude")"; touch "$exclude"
+  # Team state is local; .team/roles/ stays committable so roles can be shared.
+  # (Older versions excluded all of .team/, which blocks the re-include.)
+  if grep -qxF '.team/' "$exclude"; then
+    grep -vxF '.team/' "$exclude" >"$exclude.tmp" && mv "$exclude.tmp" "$exclude"
+  fi
+  for pat in '.team/*' '!.team/roles/' '.worktrees/' '.team-*.md'; do
+    grep -qxF -- "$pat" "$exclude" || echo "$pat" >>"$exclude"
+  done
+}
+
+load_team() { # TEAM
+  TEAM=${1:?team name required}
+  init_repo
+  ST=$ROOT/.team/$TEAM
+  [ -f "$ST/session" ] || die "no team '$TEAM' in $ROOT (see: team ls)"
+  SID=$(<"$ST/session")
+}
+
+roles_of() { cat "$ST/roles" 2>/dev/null || true; }
+block_of() { [ -f "$ST/$1.block" ] || die "team '$TEAM' has no worker '$1'"; cat "$ST/$1.block"; }
+wt_of() { cat "$ST/$1.wt"; }
+
+# prints: STATE<TAB>KIND<TAB>UPDATED_AT   (STATE=gone if the pane no longer exists)
+pstatus() { # BLOCK
+  rex block call -s "$SID" -b "$1" program_status 2>/dev/null |
+    jq -r '(.records // []) as $r
+           | ([$r[] | select(.id == null)][0] // $r[0] // {})
+           | [.state // "none", .kind // "-", .updated_at // "-"] | @tsv' ||
+    printf 'gone\t-\t-\n'
+}
+
+trust_prompt() { # BLOCK -> 0 if the worker shows Claude's folder-trust dialog
+  rex capture -s "$SID" -b "$1" --trim 2>/dev/null | grep -q 'trust this folder'
+}
+
+# Only type into a worker that is at its prompt. Typing into a permission or
+# trust dialog would answer it, so a blocked worker is never "ready".
+await_ready() { # BLOCK ROLE
+  local i st
+  for i in $(seq 1 40); do
+    st=$(pstatus "$1" | cut -f1)
+    case $st in
+      idle|done|error) return 0 ;;
+      gone) die "$2: worker pane is gone" ;;
+      blocked)
+        if trust_prompt "$1"; then
+          die "$2: waiting for you to trust its worktree folder (team focus $TEAM $2, then choose 'Yes, I trust this folder')"
+        fi
+        die "$2: blocked on a prompt; answer it in the pane first (team focus $TEAM $2)" ;;
+      working) die "$2: still working; use 'team wait' first, or 'team stop' to interrupt" ;;
+    esac
+    sleep 1
+  done
+  die "$2: did not become ready in 40s (check its tab: login prompt?)"
+}
+
+# ---------- worker prompt ----------
+
+role_file() { # ROLE -> path of the role file that applies
+  local f
+  for f in "$ROOT/.team/roles/$1.md" "$USER_ROLES/$1.md" "$BUILTIN_ROLES/$1.md" \
+           "$ROOT/.team/roles/worker.md" "$USER_ROLES/worker.md" "$BUILTIN_ROLES/worker.md"; do
+    [ -f "$f" ] && { echo "$f"; return; }
+  done
+  die "no role file for '$1' (and no roles/worker.md fallback)"
+}
+
+# Role files may start with frontmatter:   ---\nmodel: sonnet\n---
+role_meta() { # FILE KEY -> value or empty
+  awk -v key="$2" '
+    NR == 1 { if ($0 != "---") exit; next }
+    $0 == "---" { exit }
+    { k = $0; sub(/:.*/, "", k); gsub(/[ \t]/, "", k)
+      if (k == key) { v = $0; sub(/^[^:]*:[ \t]*/, "", v); sub(/[ \t]+$/, "", v); print v; exit } }
+  ' "$1"
+}
+
+role_body() { # FILE -> contents without frontmatter
+  awk 'NR == 1 && $0 == "---" { fm = 1; next } fm && $0 == "---" { fm = 0; next } !fm' "$1"
+}
+
+role_prompt() { # ROLE WORKER BRANCH
+  role_body "$(role_file "$1")"
+  cat <<EOF
+
+## Team contract
+You are the "$2" worker (role: $1) on team "$TEAM". Your working directory is a
+dedicated git worktree on branch $3. Other workers, possibly with the same role,
+run in parallel in their own worktrees on other parts of the code.
+
+- If you are told which paths you may change, change nothing outside them. If
+  the task truly needs a change elsewhere, do not make it: describe it under
+  "Open questions" instead.
+
+- Your assignment is in .team-task.md in your working directory. Re-read it
+  whenever you are told to start or continue.
+- Work only inside your working directory.
+- When you finish, or cannot continue, write .team-report.md in your working
+  directory with these sections, in this order:
+    ## Status        done | blocked | failed
+    ## Summary       what you did, in 2-5 lines
+    ## Files changed
+    ## Tests run     each command and its result
+    ## Open questions
+- Commit your work to your branch. Never commit .team-*.md files. Do not merge,
+  push, rebase or switch branches.
+- After writing the report, stop and wait for instructions.
+EOF
+}
+
+# A worker spec is ROLE (worker named after its role) or ROLE@LABEL (worker
+# named ROLE-LABEL), so one role can run as several workers: be@orders be@billing.
+spec_error() { # SPEC -> prints what is wrong with it, or nothing
+  local spec=$1 role=${1%%@*} label=${1#*@}
+  case $role in *[!A-Za-z0-9_-]*|'') echo "invalid role name in '$spec' (letters, digits, - and _)"; return ;; esac
+  case $spec in *@*) case $label in *[!A-Za-z0-9_-]*|'') echo "invalid label in '$spec' (use ROLE@LABEL)" ;; esac ;; esac
+}
+
+worker_name() { # SPEC -> worker name, or dies
+  local e; e=$(spec_error "$1"); [ -z "$e" ] || die "$e"
+  case $1 in *@*) echo "${1%%@*}-${1#*@}" ;; *) echo "$1" ;; esac
+}
+
+resolve_ref() { # REF [CONTEXT] -> commit id, or dies
+  git -C "$ROOT" rev-parse --verify --quiet "$1^{commit}" || die "${2:+$2: }unknown git ref '$1'"
+}
+
+worker_base() { # WORKER -> the commit its branch started from
+  cat "$ST/$1.base" 2>/dev/null || cat "$ST/base" 2>/dev/null ||
+    git -C "$ROOT" merge-base HEAD "team/$TEAM/$1"
+}
+
+spawn_worker() { # SPEC BASE_COMMIT [BASE_LABEL]  (requires TEAM ROOT ST WT_PARENT; SID optional)
+  local spec=$1 base=$2 base_label=${3:-} role name wt branch prompt out block
+  role=${spec%%@*}
+  name=$(worker_name "$spec")
+  [ -f "$ST/$name.block" ] && die "worker '$name' already exists in team '$TEAM' (use $role@<label> for another $role worker)"
+  wt=$WT_PARENT/$TEAM-$name
+  branch=team/$TEAM/$name
+
+  # Model: --model in TEAM_CLAUDE_ARGS wins; otherwise the role file's model:;
+  # otherwise Claude's default.
+  local extra=() model shown
+  read -r -a extra <<<"${TEAM_CLAUDE_ARGS---permission-mode auto}"
+  local sf; sf=$(settings_file)
+  [ -z "$sf" ] || extra+=(--settings "$sf")
+  model=$(role_meta "$(role_file "$role")" model)
+  case $model in *[!A-Za-z0-9._\[\]-]*) die "role '$role': invalid model '$model'" ;; esac
+  case " ${extra[*]-} " in
+    *" --model "*|*" --model="*) shown="(TEAM_CLAUDE_ARGS)" ;;
+    *) shown=${model:-default}; [ -z "$model" ] || extra+=(--model "$model") ;;
+  esac
+
+  git -C "$ROOT" worktree add -q -b "$branch" "$wt" "$base" || die "could not create worktree $wt"
+  echo "$base" >"$ST/$name.base"
+  prompt=$(role_prompt "$role" "$name" "$branch")
+  local cmd=(claude ${extra[@]+"${extra[@]}"} --append-system-prompt "$prompt")
+
+  if [ -z "${SID:-}" ]; then
+    out=$(rex new "$TEAM" -c "$wt" --window "$name" --json -- "${cmd[@]}")
+    SID=$(jq -r '.session_id' <<<"$out")
+    block=$(jq -r '.initial_windows[0].block_ids[0]' <<<"$out")
+    echo "$SID" >"$ST/session"
+  else
+    out=$(rex window new -s "$SID" "$name" -c "$wt" --focus=false --json -- "${cmd[@]}")
+    block=$(jq -r '.block_ids[0]' <<<"$out")
+  fi
+  [ -n "$block" ] && [ "$block" != null ] || die "rex did not return a block for '$name'"
+  echo "$block" >"$ST/$name.block"
+  echo "$wt" >"$ST/$name.wt"
+  echo "$role" >"$ST/$name.role"
+  echo "$name" >>"$ST/roles"
+  SPAWNED+=("$name")
+  printf '  %-14s %-28s model=%-8s %s\n' "$name" "$branch" "$shown" "$wt"
+  [ -z "$base_label" ] || printf '  %-14s based on %s (%s)\n' "" "$base_label" "$(git -C "$ROOT" rev-parse --short "$base")"
+  return 0
+}
+
+# ---------- team plans ----------
+# A plan has one worker per line:   SPEC [--base REF] [PATH...]
+# Blank lines and text after # are ignored. Paths can't contain spaces.
+# PLAN_LINES entries: SPEC<TAB>BASE_COMMIT<TAB>BASE_LABEL<TAB>PATHS ("-" = none)
+
+parse_plan() { # TEXT TEAM_BASE_COMMIT
+  local line n=0 words=() spec wbase wlabel paths i w
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line=${line%%#*}
+    read -r -a words <<<"$line"
+    [ ${#words[@]} -gt 0 ] || continue
+    spec=${words[0]}; wbase=$2; wlabel=-; paths=""
+    i=1
+    while [ $i -lt ${#words[@]} ]; do
+      if [ "${words[i]}" = --base ]; then
+        i=$((i + 1))
+        if [ $i -ge ${#words[@]} ]; then PLAN_PROBLEMS+=("plan line $n: --base needs a ref"); break; fi
+        wlabel=${words[i]}
+        wbase=$(git -C "$ROOT" rev-parse --verify --quiet "$wlabel^{commit}") ||
+          { PLAN_PROBLEMS+=("plan line $n ($spec): unknown git ref '$wlabel'"); wbase=-; }
+      else
+        w=${words[i]}; w=${w#[\"\']}; w=${w%[\"\']}   # plan files aren't shell: drop habit quotes
+        paths+="${paths:+ }$w"
+      fi
+      i=$((i + 1))
+    done
+    PLAN_LINES+=("$spec"$'\t'"$wbase"$'\t'"$wlabel"$'\t'"${paths:--}")
+  done <<<"$1"
+}
+
+# Check the whole plan before creating anything: names, branches, overlaps.
+validate_plan() {
+  local problems=("${PLAN_PROBLEMS[@]+"${PLAN_PROBLEMS[@]}"}") names=() pathsets=()
+  local line spec wbase wlabel paths name n i j a b e pa=() pb=()
+  for line in "${PLAN_LINES[@]}"; do
+    IFS=$'\t' read -r spec wbase wlabel paths <<<"$line"
+    e=$(spec_error "$spec")
+    if [ -n "$e" ]; then problems+=("$e"); continue; fi
+    name=$(worker_name "$spec")
+    for n in "${names[@]+"${names[@]}"}"; do
+      [ "$n" = "$name" ] && problems+=("worker '$name' appears twice (use ROLE@LABEL for several workers of one role)")
+    done
+    git -C "$ROOT" show-ref --verify --quiet "refs/heads/team/$TEAM/$name" &&
+      problems+=("branch team/$TEAM/$name already exists (delete it, or pick another team name)")
+    [ -e "$WT_PARENT/$TEAM-$name" ] && problems+=("folder $WT_PARENT/$TEAM-$name already exists")
+    names+=("$name"); pathsets+=("$paths")
+  done
+  for ((i = 0; i < ${#names[@]}; i++)); do
+    for ((j = i + 1; j < ${#names[@]}; j++)); do
+      [ "${names[i]}" = "${names[j]}" ] && continue
+      [ "${pathsets[i]}" = - ] || [ "${pathsets[j]}" = - ] && continue
+      read -r -a pa <<<"${pathsets[i]}"; read -r -a pb <<<"${pathsets[j]}"
+      for a in "${pa[@]}"; do for b in "${pb[@]}"; do
+        pats_overlap "$a" "$b" && problems+=("${names[i]} ($a) overlaps ${names[j]} ($b)")
+      done; done
+    done
+  done
+  [ ${#problems[@]} -eq 0 ] && return 0
+  { echo "team: plan not started, nothing was created:"; printf "  - %s\n" "${problems[@]}" | awk "!seen[\$0]++"; } >&2
+  exit 1
+}
+
+start_plan() { # spawn every PLAN_LINES worker and record its ownership
+  local line spec wbase wlabel paths name
+  for line in "${PLAN_LINES[@]}"; do
+    IFS=$'\t' read -r spec wbase wlabel paths <<<"$line"
+    [ "$wlabel" = - ] && wlabel=""
+    spawn_worker "$spec" "$wbase" "$wlabel"
+    name=${SPAWNED[${#SPAWNED[@]}-1]}
+    [ "$paths" = - ] || tr ' ' '\n' <<<"$paths" >"$ST/$name.owns"
+  done
+}
+
+send_line() { # BLOCK TEXT
+  case $2 in *$'\n'*) die "message must be one line (each newline submits a separate prompt)" ;; esac
+  rex send -s "$SID" -b "$1" "$2" >/dev/null
+  sleep 0.3
+  rex send-key -s "$SID" -b "$1" enter >/dev/null
+}
+
+mark() { # ROLE  (remember status timestamp so wait ignores pre-send state)
+  pstatus "$(block_of "$1")" | cut -f3 >"$ST/$1.mark"
+}
+
+# ---------- commands ----------
+
+cmd_up() {
+  local usage="usage: team up TEAM [--base REF] [--plan FILE|-] [SPEC...]"
+  [ $# -ge 1 ] || die "$usage"
+  TEAM=$1; shift
+  case $TEAM in *[!A-Za-z0-9_-]*|-*) die "invalid team name '$TEAM'" ;; esac
+  local base_ref=HEAD plan="" specs=() s team_base src
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --base) base_ref=${2:?--base needs a git ref}; shift 2 ;;
+      --plan) plan=${2:?--plan needs a file, or - for stdin}; shift 2 ;;
+      -*)     die "unknown option $1 ($usage)" ;;
+      *)      specs+=("$1"); shift ;;
+    esac
+  done
+  init_repo
+  ST=$ROOT/.team/$TEAM
+  [ -e "$ST/session" ] && die "team '$TEAM' already exists (team status $TEAM)"
+  rex ls --json | jq -e --arg t "$TEAM" '.sessions[] | select(.label == $t)' >/dev/null &&
+    die "a Rex session named '$TEAM' already exists"
+  team_base=$(resolve_ref "$base_ref" "--base")
+
+  PLAN_LINES=() PLAN_PROBLEMS=()
+  if [ -n "$plan" ]; then
+    if [ "$plan" = - ]; then src=$(cat); else [ -f "$plan" ] || die "no plan file '$plan'"; src=$(<"$plan"); fi
+    parse_plan "$src" "$team_base"
+  fi
+  for s in "${specs[@]+"${specs[@]}"}"; do PLAN_LINES+=("$s"$'\t'"$team_base"$'\t-\t-'); done
+  [ ${#PLAN_LINES[@]} -gt 0 ] || die "no workers given: list them (team up $TEAM be fe) or pass --plan FILE"
+  validate_plan
+
+  mkdir -p "$ST"
+  echo "$team_base" >"$ST/base"
+  SID=
+  echo "team $TEAM: base $base_ref@$(git -C "$ROOT" rev-parse --short "$team_base")"
+  SPAWNED=()
+  start_plan
+  echo "session $SID"
+  cmd_own_list
+  report_trust "${SPAWNED[@]}"
+}
+
+cmd_own_list() { # print ownership if any worker has some
+  local w any=0
+  while read -r w; do [ -s "$ST/$w.owns" ] && any=1; done < <(roles_of)
+  [ $any -eq 1 ] || return 0
+  echo "ownership:"
+  while read -r w; do printf '  %-14s %s\n' "$w" "$(owns_of "$w" | tr '\n' ' ')"; done < <(roles_of)
+}
+
+# Claude asks to trust each new worktree folder unless a parent folder is
+# already trusted. Tell the user instead of answering on their behalf.
+report_trust() { # ROLE...
+  sleep 6
+  local role pending=()
+  for role in "$@"; do trust_prompt "$(block_of "$role")" && pending+=("$role"); done
+  [ ${#pending[@]} -eq 0 ] && return 0
+  echo "ACTION NEEDED: Claude is asking to trust the worktree folder for: ${pending[*]}"
+  echo "  Open session '$TEAM' and choose 'Yes, I trust this folder' in each tab (team focus $TEAM <role>)."
+  echo "  Trusting the repo's parent folder once avoids this for future teams."
+}
+
+cmd_add() {
+  [ $# -ge 2 ] || die "usage: team add TEAM SPEC [--base REF] [PATH...]"
+  load_team "$1"; shift
+  WT_PARENT=${TEAM_WORKTREES:-$ROOT/.worktrees}
+  # Same syntax as a plan line; checked against the running team's ownership.
+  PLAN_LINES=() PLAN_PROBLEMS=()
+  parse_plan "$*" "$(cat "$ST/base" 2>/dev/null || git -C "$ROOT" rev-parse HEAD)"
+  validate_plan
+  local paths a b w new=()
+  IFS=$'\t' read -r _ _ _ paths <<<"${PLAN_LINES[0]}"
+  if [ "$paths" != - ]; then
+    read -r -a new <<<"$paths"
+    while read -r w; do
+      while read -r b; do
+        for a in "${new[@]}"; do
+          pats_overlap "$a" "$b" && die "new worker's path $a overlaps $w ($b); nothing was created"
+        done
+      done < <(owns_of "$w")
+    done < <(roles_of)
+  fi
+  SPAWNED=()
+  start_plan
+  report_trust "${SPAWNED[@]}"
+}
+
+cmd_task() {
+  [ $# -ge 2 ] || die "usage: team task TEAM ROLE [FILE]"
+  load_team "$1"; block_of "$2" >/dev/null
+  local dest; dest="$(wt_of "$2")/.team-task.md"
+  if [ $# -ge 3 ] && [ "$3" != - ]; then cp "$3" "$dest"; else cat >"$dest"; fi
+  echo "task written: $dest"
+}
+
+# ---------- file ownership ----------
+# Ownership paths are repo-relative: a directory ("src/orders/"), a file, or a
+# glob ("src/**/*.orders.ts", where * also matches /).
+
+norm_pat() { local p=${1#./}; echo "${p%/}"; }
+is_glob() { case $1 in *'*'*|*'?'*|*'['*) return 0 ;; *) return 1 ;; esac; }
+
+owns_file() { # PATTERN FILE -> 0 if FILE is covered by PATTERN
+  local p; p=$(norm_pat "$1")
+  if [ -z "$p" ]; then return 0; fi
+  if is_glob "$p"; then [[ $2 == $p ]]; return; fi
+  [ "$2" = "$p" ] || [[ $2 == "$p"/* ]]
+}
+
+pat_prefix() { # the literal directory part of a pattern
+  local p; p=$(norm_pat "$1")
+  if is_glob "$p"; then
+    p=${p%%[*?[]*}
+    case $p in */) p=${p%/} ;; */*) p=${p%/*} ;; *) p="" ;; esac
+  fi
+  echo "$p"
+}
+
+pats_overlap() { # A B -> 0 if they could cover a common file (conservative)
+  local a b; a=$(pat_prefix "$1"); b=$(pat_prefix "$2")
+  [ -z "$a" ] || [ -z "$b" ] || [ "$a" = "$b" ] || [[ $a == "$b"/* ]] || [[ $b == "$a"/* ]]
+}
+
+owns_of() { cat "$ST/$1.owns" 2>/dev/null || true; }
+
+owns_conflicts() { # one line per overlapping pair of declared paths
+  local ws=() w i j a b
+  while read -r w; do [ -s "$ST/$w.owns" ] && ws+=("$w"); done < <(roles_of)
+  for ((i = 0; i < ${#ws[@]}; i++)); do
+    for ((j = i + 1; j < ${#ws[@]}; j++)); do
+      while read -r a; do
+        while read -r b; do
+          pats_overlap "$a" "$b" && echo "  ${ws[i]} ($a) overlaps ${ws[j]} ($b)"
+        done < <(owns_of "${ws[j]}")
+      done < <(owns_of "${ws[i]}")
+    done
+  done
+  return 0
+}
+
+cmd_own() {
+  [ $# -ge 1 ] || die "usage: team own TEAM [WORKER PATH...]"
+  load_team "$1"; shift
+  if [ $# -ge 1 ]; then
+    [ $# -ge 2 ] || die "usage: team own TEAM WORKER PATH..."
+    block_of "$1" >/dev/null
+    local w=$1; shift
+    printf '%s\n' "$@" >"$ST/$w.owns"
+  fi
+  local w
+  while read -r w; do
+    printf '%-14s %s\n' "$w" "$(owns_of "$w" | tr '\n' ' ')"
+  done < <(roles_of)
+  local c; c=$(owns_conflicts)
+  [ -z "$c" ] || { echo "OVERLAP (assign will refuse until fixed):"; echo "$c"; }
+}
+
+changed_files() { # WORKER -> files changed on its branch or uncommitted in its worktree
+  local wt base; wt=$(wt_of "$1")
+  base=$(worker_base "$1")
+  {
+    git -C "$ROOT" diff --name-only "$base...team/$TEAM/$1" 2>/dev/null || true
+    git -C "$wt" status --porcelain --untracked-files=all 2>/dev/null | cut -c4- | sed 's/.* -> //' || true
+  } | grep -vE '(^|/)\.team-(task|report)\.md$|^\.claude/settings\.local\.json$' | sort -u || true
+}
+
+cmd_check() {
+  [ $# -eq 1 ] || die "usage: team check TEAM"
+  load_team "$1"
+  local w f p ok outside n bad=0 all=""
+  printf '%-14s %-8s %s\n' WORKER CHANGED OUTSIDE-OWNED
+  while read -r w; do
+    n=0; outside=""
+    while read -r f; do
+      [ -n "$f" ] || continue
+      n=$((n + 1)); all+="$f"$'\t'"$w"$'\n'
+      if [ -s "$ST/$w.owns" ]; then
+        ok=1
+        while read -r p; do owns_file "$p" "$f" && { ok=0; break; }; done < <(owns_of "$w")
+        [ $ok -eq 0 ] || outside+="    $f"$'\n'
+      fi
+    done < <(changed_files "$w")
+    if [ -s "$ST/$w.owns" ]; then
+      printf '%-14s %-8s %s\n' "$w" "$n" "$(printf '%s' "$outside" | grep -c . || true)"
+    else
+      printf '%-14s %-8s %s\n' "$w" "$n" "(no ownership declared)"
+    fi
+    [ -z "$outside" ] || { printf '%s' "$outside"; bad=1; }
+  done < <(roles_of)
+  local shared
+  shared=$(printf '%s' "$all" | awk -F'\t' 'NF == 2 { w[$1] = w[$1] " " $2; c[$1]++ }
+                                           END { for (f in c) if (c[f] > 1) print "    " f ":" w[f] }')
+  [ -z "$shared" ] || { echo "Changed by more than one worker:"; echo "$shared"; bad=1; }
+  local c; c=$(owns_conflicts)
+  [ -z "$c" ] || { echo "Declared ownership overlaps:"; echo "$c"; bad=1; }
+  [ $bad -eq 0 ] && echo "clean: no worker changed files outside its paths, no shared files"
+  return $bad
+}
+
+cmd_assign() {
+  [ $# -ge 2 ] || die "usage: team assign TEAM WORKER... [--force]"
+  load_team "$1"; shift
+  local workers=() force=0 w b msg c
+  for w in "$@"; do [ "$w" = --force ] && force=1 || workers+=("$w"); done
+  c=$(owns_conflicts)
+  if [ -n "$c" ] && [ $force -eq 0 ]; then
+    die "declared ownership overlaps; fix with 'team own' or pass --force:"$'\n'"$c"
+  fi
+  for w in "${workers[@]}"; do
+    b=$(block_of "$w")
+    [ -s "$(wt_of "$w")/.team-task.md" ] || die "no task for '$w' (team task $TEAM $w FILE)"
+    await_ready "$b" "$w"; mark "$w"
+    msg="Read .team-task.md in your working directory and complete it, following the team contract."
+    [ -s "$ST/$w.owns" ] && msg+=" You may only change these paths: $(owns_of "$w" | paste -sd, - | sed 's/,/, /g')."
+    send_line "$b" "$msg"
+    echo "assigned $w"
+  done
+}
+
+cmd_send() {
+  [ $# -eq 3 ] || die "usage: team send TEAM ROLE MESSAGE"
+  load_team "$1"
+  local b; b=$(block_of "$2")
+  await_ready "$b" "$2"; mark "$2"
+  send_line "$b" "$3"
+}
+
+cmd_wait() {
+  [ $# -ge 1 ] || die "usage: team wait TEAM [ROLE...] [--for SECONDS]"
+  load_team "$1"; shift
+  local limit=0 roles=() role
+  while [ $# -gt 0 ]; do
+    case $1 in --for) limit=${2:?}; shift 2 ;; *) roles+=("$1"); shift ;; esac
+  done
+  [ ${#roles[@]} -gt 0 ] || while read -r role; do roles+=("$role"); done < <(roles_of)
+  local start=$SECONDS line st kind ts mk pending
+  while :; do
+    pending=0
+    for role in "${roles[@]}"; do
+      line=$(pstatus "$(block_of "$role")")
+      IFS=$'\t' read -r st kind ts <<<"$line"
+      mk=$(cat "$ST/$role.mark" 2>/dev/null || echo -)
+      case $st in
+        gone) ;;
+        done|blocked|error|idle) [ "$ts" = "$mk" ] && pending=1 ;;
+        *) pending=1 ;;
+      esac
+    done
+    [ $pending -eq 0 ] && break
+    if [ "$limit" -gt 0 ] && [ $((SECONDS - start)) -ge "$limit" ]; then
+      cmd_status_rows "${roles[@]}"; echo "timed out after ${limit}s"; return 124
+    fi
+    sleep "$POLL"
+  done
+  cmd_status_rows "${roles[@]}"
+  local rc=0
+  for role in "${roles[@]}"; do
+    st=$(pstatus "$(block_of "$role")" | cut -f1)
+    case $st in error|gone) rc=3 ;; blocked) [ $rc -eq 0 ] && rc=2 ;; esac
+  done
+  return $rc
+}
+
+cmd_status_rows() { # ROLE...
+  local role st kind ts wt report
+  printf '%-14s %-9s %-11s %-7s %s\n' WORKER STATE WAITING REPORT BRANCH
+  for role in "$@"; do
+    IFS=$'\t' read -r st kind ts <<<"$(pstatus "$(block_of "$role")")"
+    wt=$(wt_of "$role")
+    report=no; [ -s "$wt/.team-report.md" ] && report=yes
+    [ "$kind" = - ] && kind=""
+    printf '%-14s %-9s %-11s %-7s %s\n' "$role" "$st" "$kind" "$report" \
+      "$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?') +$(git -C "$ROOT" rev-list --count "$(worker_base "$role")..team/$TEAM/$role" 2>/dev/null || echo '?')"
+  done
+}
+
+cmd_status() {
+  [ $# -eq 1 ] || die "usage: team status TEAM"
+  load_team "$1"
+  local roles=() role
+  while read -r role; do roles+=("$role"); done < <(roles_of)
+  cmd_status_rows "${roles[@]}"
+}
+
+cmd_read() {
+  [ $# -ge 2 ] || die "usage: team read TEAM ROLE [--screen [N]]"
+  load_team "$1"
+  local b report; b=$(block_of "$2"); report="$(wt_of "$2")/.team-report.md"
+  if [ "${3:-}" = --screen ] || [ ! -s "$report" ]; then
+    [ "${3:-}" = --screen ] || echo "(no report yet; last screen lines)"
+    rex capture -s "$SID" -b "$b" --trim --unwrap | tail -n "${4:-60}"
+  else
+    cat "$report"
+  fi
+}
+
+cmd_stop() {
+  [ $# -eq 2 ] || die "usage: team stop TEAM ROLE"
+  load_team "$1"
+  rex send-key -s "$SID" -b "$(block_of "$2")" escape >/dev/null
+  echo "sent Esc to $2"
+}
+
+cmd_focus() {
+  [ $# -eq 2 ] || die "usage: team focus TEAM ROLE"
+  load_team "$1"
+  local b; b=$(block_of "$2")
+  rex focus -s "$SID" "$b" >/dev/null
+  if rex do session.select session_id="$SID" >/dev/null 2>&1; then
+    echo "showing $TEAM/$2 in the Rex app"
+  else
+    echo "focused $TEAM/$2 in session '$TEAM' (switch to it in the session picker;"
+    echo "turn on Remote Control in Rex settings to let 'team focus' switch it for you)"
+  fi
+}
+
+cmd_inbox() {
+  local sid label b line st kind found=0
+  while IFS=$'\t' read -r sid label; do
+    for b in $(rex block ls -s "$sid" --json 2>/dev/null | jq -r '.. | objects | .block_id? // empty' | sort -u); do
+      line=$(rex block call -s "$sid" -b "$b" program_status 2>/dev/null |
+        jq -r '[.records[]? | select(.app == "claude-code" and (.state == "blocked" or .state == "done" or .state == "error"))][0]
+               // empty | [.state, (.kind // "")] | @tsv') || continue
+      [ -n "$line" ] || continue
+      IFS=$'\t' read -r st kind <<<"$line"
+      printf '%-8s %-11s %-24s %s\n' "$st" "$kind" "$label" "$b"
+      found=1
+    done
+  done < <(rex ls --json | jq -r '.sessions[] | [.session_id, .label] | @tsv')
+  [ $found -eq 1 ] || echo "nothing needs you"
+}
+
+cmd_ls() {
+  init_repo
+  local d
+  for d in "$ROOT"/.team/*/; do
+    [ -f "$d/session" ] || continue
+    printf '%-16s %s\n' "$(basename "$d")" "$(tr '\n' ' ' <"$d/roles")"
+  done
+}
+
+# ---------- shared worker permissions ----------
+
+# The settings file every worker loads with --settings: a shared allow/deny
+# list. Seeded per repo from the skill's settings.json so it can grow per repo.
+settings_file() {
+  local f=${TEAM_SETTINGS:-$ROOT/.team/settings.json}
+  [ "$f" = none ] && return 0
+  if [ ! -f "$f" ]; then
+    mkdir -p "$(dirname "$f")"
+    cp "$SKILL_DIR/settings.json" "$f"
+  fi
+  echo "$f"
+}
+
+# "Yes, and don't ask again" in a worker saves a rule to that worktree's
+# .claude/settings.local.json, which would vanish with the worktree. Merge those
+# rules into the shared settings file so every future worker inherits them.
+harvest_rules() { # ROLE WORKTREE
+  local local_f="$2/.claude/settings.local.json" sf added
+  [ -f "$local_f" ] || return 0
+  sf=$(settings_file)
+  if [ -n "$sf" ]; then
+    added=$(jq -r --arg wt "$2" --slurpfile shared "$sf" '
+      [.permissions.allow // [] | .[] | select(contains($wt) | not)]
+      - ($shared[0].permissions.allow // []) | .[]' "$local_f")
+    if [ -n "$added" ]; then
+      jq --argjson add "$(jq -R . <<<"$added" | jq -s .)" \
+        '.permissions.allow = ((.permissions.allow // []) + $add)' "$sf" >"$sf.tmp" && mv "$sf.tmp" "$sf"
+      while read -r rule; do echo "  learned from $1: $rule"; done <<<"$added"
+    fi
+  fi
+  # Remove it unless the repo tracks it, so it doesn't block worktree removal.
+  if ! git -C "$2" ls-files --error-unmatch .claude/settings.local.json >/dev/null 2>&1; then
+    rm -f "$local_f"; rmdir "$2/.claude" 2>/dev/null || true
+  fi
+}
+
+# ---------- role management ----------
+
+valid_model() { case $1 in *[!A-Za-z0-9._\[\]-]*) die "invalid model '$1'" ;; esac; }
+
+role_scope_dir() { # repo|user
+  if [ "$1" = user ]; then echo "$USER_ROLES"; else echo "$ROOT/.team/roles"; fi
+}
+
+role_scope_of() { # FILE -> repo|user|builtin
+  case $1 in "$ROOT"/.team/roles/*) echo repo ;; "$USER_ROLES"/*) echo user ;; *) echo builtin ;; esac
+}
+
+# Resolve an existing role exactly (no worker.md fallback). Prints path or nothing.
+role_lookup() { # ROLE
+  local f
+  for f in "$ROOT/.team/roles/$1.md" "$USER_ROLES/$1.md" "$BUILTIN_ROLES/$1.md"; do
+    [ -f "$f" ] && { echo "$f"; return 0; }
+  done
+  return 0
+}
+
+cmd_role() {
+  local sub=${1:-ls}; [ $# -gt 0 ] && shift
+  init_repo
+  case $sub in
+    ls)      role_ls ;;
+    new)     role_new "$@" ;;
+    show)    [ $# -eq 1 ] || die "usage: team role show ROLE"; role_show "$1" ;;
+    edit)    [ $# -eq 1 ] || die "usage: team role edit ROLE"; role_edit "$1" ;;
+    rm)      role_rm "$@" ;;
+    *)       die "usage: team role [ls|new|show|edit|rm] ..." ;;
+  esac
+}
+
+role_ls() {
+  local f name scope model desc seen=" "
+  printf '%-12s %-8s %-8s %s\n' ROLE SCOPE MODEL DESCRIPTION
+  for f in "$ROOT"/.team/roles/*.md "$USER_ROLES"/*.md "$BUILTIN_ROLES"/*.md; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f" .md)
+    scope=$(role_scope_of "$f")
+    case $seen in *" $name "*) scope="$scope*" ;; esac   # shadowed by a higher layer
+    seen="$seen$name "
+    model=$(role_meta "$f" model); model=${model:-default}
+    desc=$(role_body "$f" | grep -vE '^\s*(#|$)' | head -1 | cut -c1-60)
+    printf '%-12s %-8s %-8s %s\n' "$name" "$scope" "$model" "$desc"
+  done
+  echo "(* = overridden by a repo or user role of the same name; any other name uses 'worker')"
+  echo "(user roles: $USER_ROLES)"
+}
+
+role_new() {
+  local name="" model="" scope=repo from="" src="" force=0 dest body
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --model)  model=${2:?}; shift 2 ;;
+      --global|--user) scope=user; shift ;;
+      --from)   from=${2:?}; shift 2 ;;
+      --force)  force=1; shift ;;
+      -*)       [ "$1" = - ] && { src=-; shift; continue; }; die "unknown option $1" ;;
+      *)        if [ -z "$name" ]; then name=$1; else src=$1; fi; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: team role new ROLE [--model M] [--user] [--from ROLE] [FILE|-]"
+  case $name in *[!A-Za-z0-9_-]*) die "invalid role name '$name'" ;; esac
+  [ -z "$model" ] || valid_model "$model"
+  dest="$(role_scope_dir "$scope")/$name.md"
+  [ -e "$dest" ] && [ $force -eq 0 ] && die "$dest exists (use --force, or: team role edit $name)"
+
+  if [ -n "$src" ]; then
+    if [ "$src" = - ]; then body=$(cat); else body=$(<"$src"); fi
+  elif [ -n "$from" ]; then
+    local ff; ff=$(role_lookup "$from"); [ -n "$ff" ] || die "no role '$from' to copy"
+    body=$(role_body "$ff" | sed "1s/^# Role: .*/# Role: $name/")
+    [ -n "$model" ] || model=$(role_meta "$ff" model)
+  else
+    body=$(cat <<EOF
+# Role: $name
+One paragraph: what this worker is responsible for and what it delivers.
+
+## You do
+- The kinds of change this role makes, and where in the codebase.
+
+## You don't
+- What is out of scope (files owned by other roles, production code for read-only roles, ...).
+
+## Done means
+- The command(s) that must exit 0 before you report, e.g. \`npm test\`.
+EOF
+)
+  fi
+  # A body that brings its own frontmatter keeps it unless --model overrides.
+  if [ "$(printf '%s\n' "$body" | head -1)" = --- ]; then
+    [ -n "$model" ] || model=$(printf '%s\n' "$body" | awk 'NR>1 && /^---$/ {exit} NR>1 && sub(/^model:[ \t]*/, "") {print; exit}')
+    body=$(printf '%s\n' "$body" | awk 'NR == 1 { fm = 1; next } fm && $0 == "---" { fm = 0; next } !fm')
+    [ -z "$model" ] || valid_model "$model"
+  fi
+  mkdir -p "$(dirname "$dest")"
+  { [ -z "$model" ] || printf -- '---\nmodel: %s\n---\n' "$model"; printf '%s\n' "$body"; } >"$dest"
+  echo "created $scope role '$name' (model: ${model:-default}): $dest"
+}
+
+role_show() {
+  local f; f=$(role_lookup "$1")
+  [ -n "$f" ] || { echo "no role file '$1'; it would use the generic worker:"; f=$(role_file worker); }
+  echo "# $f ($(role_scope_of "$f"))"; cat "$f"
+}
+
+role_edit() {
+  local f; f=$(role_lookup "$1")
+  [ -n "$f" ] || die "no role '$1' (create it: team role new $1)"
+  # Built-in roles are replaced on update: edit a personal copy instead.
+  if [ "$(role_scope_of "$f")" = builtin ]; then
+    mkdir -p "$USER_ROLES"; cp "$f" "$USER_ROLES/$1.md"; f=$USER_ROLES/$1.md
+    echo "copied built-in role '$1' to your roles: $f"
+  fi
+  ${VISUAL:-${EDITOR:-vi}} "$f"
+}
+
+role_rm() {
+  local name=${1:-} scope=repo f
+  case ${2:-} in --global|--user) scope=user ;; esac
+  [ -n "$name" ] || die "usage: team role rm ROLE [--user]"
+  f="$(role_scope_dir "$scope")/$name.md"
+  if [ ! -f "$f" ]; then
+    [ -f "$BUILTIN_ROLES/$name.md" ] && die "'$name' is a built-in role and can't be removed; override it with a repo or user role"
+    die "no $scope role '$name'"
+  fi
+  rm "$f"; echo "removed $scope role '$name'"
+}
+
+cmd_rules() {
+  init_repo
+  local sf; sf=$(settings_file)
+  [ -n "$sf" ] || { echo "TEAM_SETTINGS=none: workers use only your normal Claude settings"; return 0; }
+  echo "$sf  (edit freely; workers load it with --settings)"
+  jq -r '"allow:", (.permissions.allow // [] | .[] | "  " + .), "deny:", (.permissions.deny // [] | .[] | "  " + .)' "$sf"
+}
+
+cmd_down() {
+  [ $# -ge 1 ] || die "usage: team down TEAM [--force]"
+  load_team "$1"
+  local force=${2:-} role wt kept=0
+  rex kill "$SID" >/dev/null 2>&1 || true
+  echo "closed session $TEAM"
+  while read -r role; do
+    wt=$(wt_of "$role")
+    harvest_rules "$role" "$wt"
+    rm -f "$wt/.team-task.md" "$wt/.team-report.md" 2>/dev/null || true
+    if git -C "$ROOT" worktree remove ${force:+--force} "$wt" 2>/dev/null; then
+      echo "  removed worktree $role (branch team/$TEAM/$role kept)"
+    else
+      echo "  KEPT worktree $wt: uncommitted changes (rerun with --force to discard)"
+      kept=1
+    fi
+  done < <(roles_of)
+  [ $kept -eq 0 ] && rm -rf "$ST"
+  return 0
+}
+
+[ $# -ge 1 ] || { usage; exit 1; }
+sub=$1; shift
+case $sub in
+  up|add)                    require git jq rex claude server; "cmd_$sub" "$@" ;;
+  task|own|check|ls|role|rules) require git jq; "cmd_$sub" "$@" ;;
+  assign|send|wait|status|read|stop|focus|inbox|down) require git jq rex; "cmd_$sub" "$@" ;;
+  doctor) cmd_doctor ;;
+  -h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac

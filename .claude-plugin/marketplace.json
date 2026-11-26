@@ -1,0 +1,14 @@
+{
+  "name": "team-skill",
+  "description": "Claude Code extensions for Rex: agent teams with parallel workers in their own tabs, worktrees and branches.",
+  "owner": {
+    "name": "ourbjorn"
+  },
+  "plugins": [
+    {
+      "name": "rex-x",
+      "source": "./plugins/rex-x",
+      "description": "Agent teams in Rex: a lead Claude orchestrates parallel worker Claudes in their own tabs, worktrees and branches."
+    }
+  ]
+}

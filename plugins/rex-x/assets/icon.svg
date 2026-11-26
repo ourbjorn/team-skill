@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1b1e2b"/><stop offset="1" stop-color="#0f1118"/></linearGradient>
+    <linearGradient id="lead" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8b6cff"/><stop offset="1" stop-color="#4f8dff"/></linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="230" fill="url(#bg)"/>
+  <!-- branches -->
+  <g fill="none" stroke="#3d4562" stroke-width="30" stroke-linecap="round">
+    <path d="M512 360 C 512 520, 262 540, 262 690"/>
+    <path d="M512 360 L 512 690"/>
+    <path d="M512 360 C 512 520, 762 540, 762 690"/>
+  </g>
+  <!-- lead -->
+  <circle cx="512" cy="270" r="122" fill="url(#lead)"/>
+  <path d="M470 222 L536 270 L470 318" fill="none" stroke="#fff" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- workers with status rings -->
+  <g stroke-width="22">
+    <circle cx="262" cy="770" r="80" fill="#262b3d" stroke="#3ddc97"/>
+    <circle cx="512" cy="770" r="80" fill="#262b3d" stroke="#5bc0ff" stroke-dasharray="380 200" transform="rotate(-90 512 770)"/>
+    <circle cx="762" cy="770" r="80" fill="#262b3d" stroke="#ffb84d"/>
+  </g>
+</svg>
